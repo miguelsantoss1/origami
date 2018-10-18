@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 =begin
 
     This file is part of Origami, PDF manipulation framework for Ruby
@@ -121,6 +122,113 @@ module Origami
                         [ HexaString.new(certificate.to_der) ] + ca.map{ |crt| HexaString.new(crt.to_der) }
                     end
             end
+
+            #
+            #  Flattening the PDF to get file view.
+            #
+            compile
+
+            #
+            # Creating an empty Xref table to compute signature byte range.
+            #
+            rebuild_dummy_xrefs
+
+            sig_offset = get_object_offset(digsig.no, digsig.generation) + digsig.signature_offset
+
+            digsig.ByteRange[0] = 0
+            digsig.ByteRange[1] = sig_offset
+            digsig.ByteRange[2] = sig_offset + digsig.Contents.to_s.bytesize
+
+            until digsig.ByteRange[3] == filesize - digsig.ByteRange[2]
+                digsig.ByteRange[3] = filesize - digsig.ByteRange[2]
+            end
+
+            # From that point on, the file size remains constant
+
+            #
+            # Correct Xrefs variations caused by ByteRange modifications.
+            #
+            rebuild_xrefs
+
+            file_data = output()
+            signable_data = file_data[digsig.ByteRange[0],digsig.ByteRange[1]] +
+                file_data[digsig.ByteRange[2],digsig.ByteRange[3]]
+
+            #
+            # Computes and inserts the signature.
+            #
+            signature = Signature.compute(method, signable_data, certificate, key, ca)
+            digsig.Contents[0, signature.size] = signature
+
+            #
+            # No more modification are allowed after signing.
+            #
+            self.freeze
+        end
+
+        def certificate(certificate, key,
+                             method: Signature::PKCS7_DETACHED,
+                             ca: [],
+                             annotation: nil,
+                             issuer: nil,
+                             location: nil,
+                             contact: nil,
+                             reason: nil)
+
+            unless certificate.is_a?(OpenSSL::X509::Certificate)
+                raise TypeError, "A OpenSSL::X509::Certificate object must be passed."
+            end
+
+            unless key.is_a?(OpenSSL::PKey::RSA)
+                raise TypeError, "A OpenSSL::PKey::RSA object must be passed."
+            end
+
+            unless ca.is_a?(::Array)
+                raise TypeError, "Expected an Array of CA certificate."
+            end
+
+            unless annotation.nil? or annotation.is_a?(Annotation::Widget::Signature)
+                raise TypeError, "Expected a Annotation::Widget::Signature object."
+            end
+
+
+            digsig = Signature::DigitalSignature.new.set_indirect(true)
+
+            if annotation.nil?
+                annotation = Annotation::Widget::Signature.new
+                annotation.Rect = Rectangle[:llx => 0.0, :lly => 0.0, :urx => 0.0, :ury => 0.0]
+            end
+
+            annotation.V = digsig
+            annotation.T = 'SignatureField1'
+
+            add_fields(annotation)
+            self.Catalog.AcroForm.SigFlags = 3
+
+            digsig.Type = :Sig
+            digsig.Contents = HexaString.new("\x00" * Signature::required_size(method, certificate, key, ca))
+            digsig.SubFilter = Name.new(method)
+            digsig.ByteRange = [0, 0, 0, 0]
+            digsig.Name = issuer
+
+            digsig.Location = HexaString.new(location) if location
+            digsig.ContactInfo = HexaString.new(contact) if contact
+            digsig.Reason = HexaString.new(reason) if reason
+
+            sigref = Signature::Reference.new
+            sigref.Type = :SigRef
+            sigref.TransformMethod = :DocMDP
+            # sigref.Data = self.Catalog
+
+            sigref.TransformParams = UsageRights::TransformParamsDocMDP.new
+            sigref.TransformParams.P = 1
+            sigref.TransformParams.Type = :TransformParams
+            sigref.TransformParams.V = Name.new("1.2")
+
+            digsig.Reference = [ sigref ]
+
+            self.Catalog.Perms ||= Perms.new
+            self.Catalog.Perms.DocMDP = digsig
 
             #
             #  Flattening the PDF to get file view.
@@ -574,6 +682,22 @@ module Origami
             EF_ALL = %i[EF Create Delete Modify Import]
 
             ALL = [ DOCUMENT_ALL, ANNOTS_ALL, FORM_ALL, SIGNATURE_ALL, EF_ALL ]
+        end
+
+        class TransformParamsDocMDP < Dictionary
+            include StandardObject
+
+            VERSION = Name.new("1.2")
+
+            field   :Type,              :Type => Name, :Default => :TransformParams
+            field   :V,                 :Type => Name, :Default => VERSION
+            field   :P,                 :Type => Integer, :Default => 1
+
+            def initialize(hash = {}, parser = nil)
+                set_indirect(false)
+
+                super(hash, parser)
+            end
         end
 
         class TransformParams < Dictionary
